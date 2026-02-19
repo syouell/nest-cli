@@ -123,6 +123,10 @@ pub async fn device_status(id: &str) -> Result<(), BoxError> {
 }
 
 pub async fn set_temperature(id: &str, temp_f: f64) -> Result<(), BoxError> {
+    if !(50.0..=90.0).contains(&temp_f) {
+        return Err("Temperature must be between 50°F and 90°F.".into());
+    }
+
     let client = Client::new().await?;
 
     // Determine current mode to pick the right command

@@ -1,15 +1,24 @@
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use yup_oauth2::authenticator::Authenticator;
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
 type BoxError = Box<dyn std::error::Error>;
 type HttpsConnector = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
 
+/// Set file permissions to owner-only read/write (0600).
+fn restrict_permissions(path: &Path) -> Result<(), BoxError> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 fn config_dir() -> Result<PathBuf, BoxError> {
     let dir = dirs::config_dir()
         .ok_or("Could not determine config directory")?
         .join("nest-cli");
     std::fs::create_dir_all(&dir)?;
+    // Restrict config directory to owner-only access
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(dir)
 }
 
@@ -30,10 +39,14 @@ pub async fn login(client_secret_file: &str, project_id: &str) -> Result<(), Box
     let secret = yup_oauth2::read_application_secret(client_secret_file).await?;
 
     // Copy the client secret to config dir for later use
-    std::fs::copy(client_secret_file, client_secret_path()?)?;
+    let secret_dest = client_secret_path()?;
+    std::fs::copy(client_secret_file, &secret_dest)?;
+    restrict_permissions(&secret_dest)?;
 
     // Save the project ID
-    std::fs::write(project_id_path()?, project_id)?;
+    let pid_path = project_id_path()?;
+    std::fs::write(&pid_path, project_id)?;
+    restrict_permissions(&pid_path)?;
 
     let auth = InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
         .persist_tokens_to_disk(token_path()?)

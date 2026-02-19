@@ -21,7 +21,7 @@ impl Client {
 
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()?
-            .https_or_http()
+            .https_only()
             .enable_http2()
             .build();
 

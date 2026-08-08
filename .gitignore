@@ -1,1 +1,8 @@
 /target
+
+# westoncthistory scraper output (large, generated, not source)
+/westoncthistory-mirror/
+/westoncthistory/westoncthistory-mirror/
+__pycache__/
+*.pyc
+.venv/

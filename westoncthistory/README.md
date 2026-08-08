@@ -32,14 +32,20 @@ HTML.
 - Leaves external links (social media, embedded calendars, third-party
   widgets, `mailto:`/`tel:` links, etc.) untouched in the HTML and does
   **not** follow them — it just records that they were seen and skipped.
+- Fetches `/robots.txt` before crawling and honors it: any URL disallowed
+  for its User-Agent is never fetched (the link is rewritten to point at
+  the live site instead of a local file that won't exist), and if the
+  site publishes a `Crawl-delay` longer than `--delay`, that longer delay
+  is used instead. See [robots.txt support](#robotstxt-support) below.
 - Sends one request at a time with a **1 second delay** between requests
   by default, and a descriptive `User-Agent` identifying the crawl as an
   archival mirror run for the site owner (with a contact email), so it's
   clear to the site/host what the traffic is and why.
 - Writes a full crawl log (`crawl.log`, written live as it runs) and a
   final summary report (`crawl-report.txt`) listing every page visited,
-  every asset downloaded, every error (404s, timeouts, etc.), and every
-  external/skipped link — all with the page that linked to them.
+  every asset downloaded, every error (404s, timeouts, etc.), every
+  external/skipped link, and every URL skipped due to `robots.txt` — all
+  with the page that linked to them.
 
 ## Requirements
 
@@ -86,6 +92,29 @@ python3 scraper.py \
 | `--timeout` | `25` | Per-request read timeout, in seconds. |
 | `--contact-email` | `stephen@youell.net` | Embedded in the default User-Agent string. |
 | `--user-agent` | *(built from the above)* | Override the User-Agent entirely. |
+| `--ignore-robots` | off | Skip fetching/honoring `robots.txt` entirely. |
+
+### robots.txt support
+
+Before crawling, the tool fetches `https://westoncthistory.org/robots.txt`
+and checks every internal URL against it (matched against the crawler's
+product token, `WestonCTHistoryArchivalMirrorBot`, and any `User-agent: *`
+rules):
+
+- **Disallowed URLs are never fetched.** They're recorded in the
+  `DISALLOWED BY ROBOTS.TXT` section of `crawl-report.txt`, and any link
+  pointing at one is rewritten to the live `https://westoncthistory.org/...`
+  URL instead of a local path, so the mirror doesn't end up with dead
+  links to pages it was told not to download.
+- **A `Crawl-delay` directive, if present, raises `--delay`** to at least
+  that value (it only ever makes the crawl slower/more polite, never
+  faster than what you asked for).
+- If `robots.txt` is missing (404) or fails to load, the crawl proceeds
+  normally with no extra restrictions. If it responds with `401`/`403`,
+  that's treated as a full disallow, per [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309).
+- Pass `--ignore-robots` to skip all of this (e.g. if the site owner has
+  separately given you permission to crawl paths robots.txt blocks for
+  generic bots).
 
 The crawl can take a while for a full site at 1 request/second — this is
 intentional (politeness), not a bug. You can safely `Ctrl-C` it; it will
@@ -137,6 +166,9 @@ Always check `crawl-report.txt` after a run:
 - **EXTERNAL / SKIPPED LINKS** — things intentionally not downloaded
   (social media links, embedded calendar widgets, `mailto:` links, etc.),
   with the page each was found on.
+- **DISALLOWED BY ROBOTS.TXT** — internal URLs that robots.txt says not to
+  fetch, with the page each was found on. Empty unless the site's
+  `robots.txt` actually restricts something.
 - **REDIRECTS FOLLOWED** — any internal redirects the crawler followed
   transparently.
 

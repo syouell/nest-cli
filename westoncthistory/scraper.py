@@ -38,6 +38,7 @@ from urllib.parse import (
     parse_qsl,
     unquote,
 )
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
@@ -101,6 +102,7 @@ class CrawlStats:
     errors: list = field(default_factory=list)       # (url, referrer, reason)
     external_skipped: list = field(default_factory=list)  # (url, referrer, reason)
     redirects: list = field(default_factory=list)    # (from_url, to_url)
+    robots_disallowed: list = field(default_factory=list)  # (url, referrer)
 
 
 # --------------------------------------------------------------------------
@@ -216,6 +218,7 @@ class SiteMirrorCrawler:
         user_agent: str,
         max_pages: int,
         logger: logging.Logger,
+        respect_robots: bool = True,
     ):
         self.start_url = strip_fragment(start_url)
         self.allowed_domain = normalize_host(urlparse(self.start_url).netloc)
@@ -224,6 +227,13 @@ class SiteMirrorCrawler:
         self.timeout = timeout
         self.max_pages = max_pages
         self.log = logger
+
+        self.user_agent = user_agent
+        # robots.txt matches rules against the leading product token of the
+        # UA (everything before the first "/"), same as most crawlers.
+        self.robots_token = user_agent.split("/")[0].strip()
+        self.respect_robots = respect_robots
+        self.robots = RobotFileParser()
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
@@ -245,6 +255,53 @@ class SiteMirrorCrawler:
     def _get(self, url: str):
         self._throttle()
         return self.session.get(url, timeout=self.timeout, allow_redirects=True)
+
+    # -- robots.txt ----------------------------------------------------
+
+    def load_robots_txt(self):
+        """Fetch and parse robots.txt for the start URL's host, if any.
+        Also picks up a Crawl-delay directive (raising --delay if the
+        site asks for something slower). Best-effort: if robots.txt can't
+        be fetched at all, we proceed as if everything is allowed."""
+        if not self.respect_robots:
+            self.log.info("robots.txt checking disabled (--ignore-robots)")
+            return
+
+        robots_url = urljoin(self.start_url, "/robots.txt")
+        try:
+            resp = self._get(robots_url)
+        except requests.RequestException as exc:
+            self.log.warning(
+                "robots.txt unreachable (%s) - proceeding without robots.txt restrictions", exc
+            )
+            return
+
+        if resp.status_code == 200:
+            self.robots.parse(resp.text.splitlines())
+            self.log.info("Loaded robots.txt from %s (User-agent token: %s)", robots_url, self.robots_token)
+
+            delay = self.robots.crawl_delay(self.robots_token)
+            if delay:
+                delay = float(delay)
+                if delay > self.delay:
+                    self.log.info(
+                        "robots.txt specifies Crawl-delay: %.1fs - raising delay from %.1fs",
+                        delay,
+                        self.delay,
+                    )
+                    self.delay = delay
+        elif resp.status_code in (401, 403):
+            # RFC 9309: treat an unreadable-due-to-auth robots.txt as a
+            # blanket disallow, same as major crawlers do.
+            self.log.warning(
+                "robots.txt returned HTTP %s - treating as full disallow", resp.status_code
+            )
+            self.robots.parse(["User-agent: *", "Disallow: /"])
+        else:
+            self.log.info(
+                "No robots.txt found (HTTP %s) - proceeding without robots.txt restrictions",
+                resp.status_code,
+            )
 
     # -- classification ----------------------------------------------------
 
@@ -273,11 +330,17 @@ class SiteMirrorCrawler:
 
     def maybe_enqueue(self, url: str, kind: str, referrer: str) -> bool:
         """Queue an internal URL for fetching if we haven't seen it yet.
-        Returns True if it was (or already had been) queued as internal."""
+        Returns True if it was (or already had been) queued as internal,
+        False if it's not internal or robots.txt disallows fetching it."""
         key = self._dedupe_key(url)
         if key in self.queued_or_done:
             return True
         if not self.mirror.is_internal(url):
+            return False
+        if self.respect_robots and not self.robots.can_fetch(self.robots_token, url):
+            self.queued_or_done.add(key)
+            self.stats.robots_disallowed.append((url, referrer))
+            self.log.info("SKIP   %s (disallowed by robots.txt)", url)
             return False
         self.queued_or_done.add(key)
         self.queue.append(Task(url=url, kind=kind, referrer=referrer))
@@ -331,7 +394,12 @@ class SiteMirrorCrawler:
         if kind == "asset" and absolute.lower().split("?")[0].endswith(".css"):
             kind = "css"
 
-        self.maybe_enqueue(absolute, kind, referrer)
+        enqueued = self.maybe_enqueue(absolute, kind, referrer)
+        if not enqueued:
+            # Internal but robots.txt disallows fetching it: leave a live,
+            # absolute link to the real page rather than a relative path
+            # to a local file we were told not to download.
+            return absolute + (f"#{fragment}" if fragment else "")
 
         target_rel = self.mirror.local_path_for(absolute, "page" if kind == "page" else "asset")
         referrer_rel = (
@@ -494,7 +562,15 @@ class SiteMirrorCrawler:
 
     def run(self):
         self.log.info("Starting crawl of %s (allowed domain: %s)", self.start_url, self.allowed_domain)
-        self.maybe_enqueue(self.start_url, "page", "")
+        self.load_robots_txt()
+
+        if not self.maybe_enqueue(self.start_url, "page", ""):
+            self.log.warning(
+                "Start URL %s is disallowed by robots.txt - nothing to crawl. "
+                "Pass --ignore-robots to override.",
+                self.start_url,
+            )
+            return
 
         pages_seen = 0
         while self.queue:
@@ -514,11 +590,13 @@ class SiteMirrorCrawler:
                 self.process_asset(task)
 
         self.log.info(
-            "Crawl finished: %d pages, %d assets, %d errors, %d external/skipped links",
+            "Crawl finished: %d pages, %d assets, %d errors, %d external/skipped links, "
+            "%d disallowed by robots.txt",
             len(self.stats.pages_ok),
             len(self.stats.assets_ok),
             len(self.stats.errors),
             len(self.stats.external_skipped),
+            len(self.stats.robots_disallowed),
         )
 
 
@@ -537,6 +615,7 @@ def write_report(stats: CrawlStats, output_dir: Path, start_url: str):
     lines.append(f"Assets saved:     {len(stats.assets_ok)}")
     lines.append(f"Errors:           {len(stats.errors)}")
     lines.append(f"External/skipped: {len(stats.external_skipped)}")
+    lines.append(f"Robots-disallowed: {len(stats.robots_disallowed)}")
     lines.append(f"Redirects seen:   {len(stats.redirects)}")
     lines.append("")
 
@@ -569,6 +648,14 @@ def write_report(stats: CrawlStats, output_dir: Path, start_url: str):
     for url, referrer, reason in stats.external_skipped:
         lines.append(f"  {url}")
         lines.append(f"      reason:   {reason}")
+        lines.append(f"      found on: {referrer or '(start url)'}")
+
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append(f"DISALLOWED BY ROBOTS.TXT - NOT FOLLOWED ({len(stats.robots_disallowed)})")
+    lines.append("-" * 60)
+    for url, referrer in stats.robots_disallowed:
+        lines.append(f"  {url}")
         lines.append(f"      found on: {referrer or '(start url)'}")
 
     lines.append("")
@@ -643,6 +730,15 @@ def parse_args(argv=None):
         default=None,
         help="Override the full User-Agent string instead of building the default one.",
     )
+    parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help=(
+            "Do not fetch or honor robots.txt. Off by default - the crawler "
+            "normally fetches /robots.txt, skips any disallowed URLs, and "
+            "raises --delay to match a Crawl-delay directive if one is set."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -661,6 +757,7 @@ def main(argv=None):
         user_agent=user_agent,
         max_pages=args.max_pages,
         logger=logger,
+        respect_robots=not args.ignore_robots,
     )
 
     try:
